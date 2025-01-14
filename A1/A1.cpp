@@ -110,14 +110,16 @@ protected:
 
 
         for (const auto& p : cluster_data.points) {
-            min_x = std::min(min_x, p.x);
-            max_x = std::max(max_x, p.x);
-            min_y = std::min(min_y, p.y);
-            max_y = std::max(max_y, p.y);
+            min_x = std::min(min_x, p.x);  // Guaranteed to pick p.x on 1st iteration
+            max_x = std::max(max_x, p.x);  // Same
+            
+            min_y = std::min(min_y, p.y);  // Guaranteed to pick p.y on 1st iteration
+            max_y = std::max(max_y, p.y);  // Same
         }
         for (const auto& p : cluster_data.centroids) {
             min_x = std::min(min_x, p.x);
             max_x = std::max(max_x, p.x);
+            
             min_y = std::min(min_y, p.y);
             max_y = std::max(max_y, p.y);
         }
@@ -148,6 +150,7 @@ protected:
             cr->stroke();
         }
 
+
         // Draw axes
         cr->set_source_rgb(0.0, 0.0, 0.0);  // Black color
         cr->set_line_width(2.0);
@@ -162,20 +165,21 @@ protected:
         cr->line_to(padding, padding);
         cr->stroke();
 
+
         // Add axis labels
         cr->set_font_size(12);
 
         // X-axis labels
         for (int x = (int)min_x; x <= (int)max_x; x++) {
             double screen_x = (x - min_x) * scale_x + padding;
-            cr->move_to(screen_x - 5, height - padding + 20);
+            cr->move_to(screen_x - 5, height - padding + 20);  // Adjusted by trial and error for better visibility
             cr->show_text(std::to_string(x));
         }
 
         // Y-axis labels
         for (int y = (int)min_y; y <= (int)max_y; y++) {
             double screen_y = height - ((y - min_y) * scale_y + padding);
-            cr->move_to(padding - 30, screen_y + 5);
+            cr->move_to(padding - 30, screen_y + 5);  // Adjusted by trial and error for better visibility
             cr->show_text(std::to_string(y));
         }
 
@@ -196,6 +200,7 @@ protected:
             double screen_x = (p.x - min_x) * scale_x + padding;
             double screen_y = height - ((p.y - min_y) * scale_y + padding);
             
+            // rectangle starts at top-left corner, so we need to adjust
             cr->rectangle(screen_x - 5, screen_y - 5, 10, 10);
             cr->fill();
         }
@@ -206,7 +211,7 @@ protected:
 
 class MainWindow : public Gtk::Window {
 private:
-    DrawingArea_ area;
+    DrawingArea_ drawingArea;
 
 public:
     MainWindow() {
@@ -223,18 +228,18 @@ public:
         box.append(button);
 
         // Add drawing area
-        box.append(area);
+        box.append(drawingArea);
     }
 
 protected:
     void on_button_clicked() {
         std::cout << "Button clicked" << std::endl;
         
-        ClusterData data; // Created ClusterData object
+        ClusterData data; // Instantiated ClusterData object
         
         if (data.load_from_file("dataPoints2.txt")) {
             std::cout << "File loaded successfully" << std::endl;
-            area.set_data(data);
+            drawingArea.set_data(data);
         } else {
             std::cout << "File load failed" << std::endl;
         }
@@ -251,3 +256,6 @@ int main(int argc, char* argv[]) {
     
     return app->make_window_and_run<MainWindow>(argc, argv);
 }
+
+
+// g++ -o A1 A1.cpp `pkg-config --cflags --libs gtkmm-4.0`
