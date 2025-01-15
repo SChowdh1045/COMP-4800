@@ -87,10 +87,11 @@ public:
 
     void set_data(const ClusterData& data) {
         cluster_data = data;
-        queue_draw(); // Request a redraw with the new data
+        queue_draw(); // Request a redraw with the new data (calls on_draw())
     }
 
 protected:
+    // custom method
     void on_draw(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) {
         // Clear background to white
         cr->set_source_rgb(1.0, 1.0, 1.0);
@@ -99,14 +100,12 @@ protected:
         // If no data, return
         if (cluster_data.points.empty() && cluster_data.centroids.empty()) return;
 
-        // Add this as a class member in DrawingArea_
-        bool start_from_origin = true;  // Toggle between (0,0) and (min_x,min_y)
-
-        // Then modify the range calculation in on_draw:
-        double min_x = start_from_origin ? 0 : std::numeric_limits<double>::max();
-        double min_y = start_from_origin ? 0 : std::numeric_limits<double>::max();
-        double max_x = std::numeric_limits<double>::lowest();
-        double max_y = std::numeric_limits<double>::lowest();
+        
+        // Initializing min_ and max_
+        double min_x = std::numeric_limits<double>::max();  // Initialize min_ to largest possible value to get ready for looping
+        double max_x = std::numeric_limits<double>::lowest();  // Initialize max_ to smallest possible value to get ready for looping
+        double min_y = std::numeric_limits<double>::max();  // Same concept for min_
+        double max_y = std::numeric_limits<double>::lowest();  // Same concept for max_
 
 
         for (const auto& p : cluster_data.points) {
@@ -124,86 +123,164 @@ protected:
             max_y = std::max(max_y, p.y);
         }
 
+        // Find the maximum extent in any direction
+        double max_extent_x = std::max(std::abs(min_x), std::abs(max_x));
+        double max_extent_y = std::max(std::abs(min_y), std::abs(max_y));
+
+        // Need to use these for scaling to ensure the graph is centered
+        max_x = max_extent_x;
+        min_x = -max_extent_x;
+        max_y = max_extent_y;
+        min_y = -max_extent_y;
+        
+
         // Add padding
         double padding = 50;
-        double scale_x = (width - 2 * padding) / (max_x - min_x);
-        double scale_y = (height - 2 * padding) / (max_y - min_y);
+
+        // Calculate available space
+        double available_width = width - (2 * padding);
+        double available_height = height - (2 * padding);
+
+        // For a 4-quadrant system, each quadrant gets half the available space
+        double quadrant_width = available_width / 2;
+        double quadrant_height = available_height / 2;
+
+        // Calculate scaling factors (i.e. how many pixels are between each data unit in the x and y direction)
+        // Note: max_x and min_x are now equal in magnitude but opposite in sign
+        // Same for max_y and min_y
+        double scale_x = quadrant_width / max_x;   // or quadrant_height / max_extent_x
+        double scale_y = quadrant_height / max_y;   // or quadrant_height / max_extent_y
 
 
-        // Draw grid lines
-        cr->set_source_rgba(0.8, 0.8, 0.8, 0.5);  // Light gray, semi-transparent
+
+       // DRAWING GRID LINES AND LABELS
+
+        // Calculate reasonable grid spacing
+        auto calculate_grid_interval = [](double max_val) {
+            if (max_val <= 5) return 1.0;      // -5 to 5: step by 1 (at most 5 grid lines per quadrant - not including 0 (same for all cases))
+            if (max_val <= 20) return 5.0;     // -20 to 20: step by 5 (at most 4 grid lines per quadrant)
+            if (max_val <= 50) return 10.0;    // -50 to 50: step by 10 (at most 5 grid lines per quadrant)
+            return ceil(max_val / 10);         // Larger ranges: step by max/10 rounded up (at most 10 grid lines per quadrant)
+        };
+
+        double x_interval = calculate_grid_interval(max_x);
+        double y_interval = calculate_grid_interval(max_y);
+
+        // Center point (origin) in screen coordinates
+        double center_x = quadrant_width + padding;  // quadrant_width = available_width / 2
+        double center_y = quadrant_height + padding;  // quadrant_height = available_height / 2
+
+        cr->set_source_rgba(0.3, 0.3, 0.3, 0.5);  // Gray color
         cr->set_line_width(0.5);
 
-        // Vertical grid lines
-        for (int x = (int)min_x; x <= (int)max_x; x++) {
-            double screen_x = (x - min_x) * scale_x + padding;
-            cr->move_to(screen_x, padding);
-            cr->line_to(screen_x, height - padding);
+        // Vertical grid lines and x labels
+        for (double x = 0; x <= max_x; x += x_interval) {
+            // Positive x grid lines
+            double screen_x = center_x + (x * scale_x);
+            cr->move_to(screen_x, padding);  // from top edge (on quadrants 1 and 4)
+            cr->line_to(screen_x, height - padding);  // to bottom edge (on quadrants 1 and 4)
             cr->stroke();
+
+            // Label +ive x-axis
+            draw_XLabels(cr, screen_x, center_y, x);
+
+            // Negative x grid lines (except for 0)
+            if (x != 0) {
+                screen_x = center_x - (x * scale_x);
+                cr->move_to(screen_x, padding);  // from top edge (on quadrants 2 and 3)
+                cr->line_to(screen_x, height - padding);  // to bottom edge (on quadrants 2 and 3)
+                cr->stroke();
+                
+                // Label -ive x-axis
+                draw_XLabels(cr, screen_x, center_y, -x);
+            }
         }
 
-        // Horizontal grid lines
-        for (int y = (int)min_y; y <= (int)max_y; y++) {
-            double screen_y = height - ((y - min_y) * scale_y + padding);
-            cr->move_to(padding, screen_y);
-            cr->line_to(width - padding, screen_y);
+        // Horizontal grid lines and y labels
+        for (double y = 0; y <= max_y; y += y_interval) {
+            // Positive y grid lines
+            double screen_y = center_y - (y * scale_y);
+            cr->move_to(padding, screen_y);  // from left edge (on quadrants 2 and 1)
+            cr->line_to(width - padding, screen_y);  // to right edge (on quadrants 2 and 1)
             cr->stroke();
+            
+            // Negative y grid lines (except for 0) (and positive y labels)
+            if (y != 0) {
+                // Label +ive y-axis
+                draw_YLabels(cr, center_x, screen_y, y); // I don't want to draw a 0 label on the y-axis
+
+                screen_y = center_y + (y * scale_y);
+                cr->move_to(padding, screen_y);  // from left edge (on quadrants 3 and 4)
+                cr->line_to(width - padding, screen_y);  // to right edge (on quadrants 3 and 4)
+                cr->stroke();
+
+                // Label -ive y-axis
+                draw_YLabels(cr, center_x, screen_y, -y);
+            }   
         }
 
 
-        // Draw axes
+
+        // DRAWING AXES LINES
         cr->set_source_rgb(0.0, 0.0, 0.0);  // Black color
         cr->set_line_width(2.0);
 
         // X-axis
-        cr->move_to(padding, height - padding);
-        cr->line_to(width - padding, height - padding);
+        cr->move_to(padding, center_y);  // from left edge
+        cr->line_to(width - padding, center_y);  // to right edge
         cr->stroke();
 
         // Y-axis
-        cr->move_to(padding, height - padding);
-        cr->line_to(padding, padding);
+        cr->move_to(center_x, padding);  // from top edge
+        cr->line_to(center_x, height - padding);  // to bottom edge
         cr->stroke();
 
 
-        // Add axis labels
-        cr->set_font_size(12);
 
-        // X-axis labels
-        for (int x = (int)min_x; x <= (int)max_x; x++) {
-            double screen_x = (x - min_x) * scale_x + padding;
-            cr->move_to(screen_x - 5, height - padding + 20);  // Adjusted by trial and error for better visibility
-            cr->show_text(std::to_string(x));
-        }
-
-        // Y-axis labels
-        for (int y = (int)min_y; y <= (int)max_y; y++) {
-            double screen_y = height - ((y - min_y) * scale_y + padding);
-            cr->move_to(padding - 30, screen_y + 5);  // Adjusted by trial and error for better visibility
-            cr->show_text(std::to_string(y));
-        }
-
-
-        // Draw data points (blue circles)
+        // DRAWING DATA POINTS (BLUE CIRCLES)
         cr->set_source_rgb(0.0, 0.0, 1.0);  // Blue color
         for (const auto& p : cluster_data.points) {
-            double screen_x = (p.x - min_x) * scale_x + padding;
-            double screen_y = height - ((p.y - min_y) * scale_y + padding);
+            double screen_x = center_x + (p.x * scale_x);
+            double screen_y = center_y - (p.y * scale_y);  // Invert y-axis
             
-            cr->arc(screen_x, screen_y, 5, 0, 2 * M_PI);
+            // screen_x: x-coordinate of circle's center
+            // screen_y: y-coordinate of circle's center
+            // 5: radius of the circle in pixels
+            // 0: starting angle in radians (0 = right side of circle)
+            // 2 * M_PI: ending angle in radians (2π = full circle)
+            cr->arc(screen_x, screen_y, 4, 0, 2 * M_PI);
             cr->fill();
         }
 
-        // Draw centroids (red squares)
+        // DRAWING CENTROIDS (RED SQUARES)
         cr->set_source_rgb(1.0, 0.0, 0.0);  // Red color
         for (const auto& p : cluster_data.centroids) {
-            double screen_x = (p.x - min_x) * scale_x + padding;
-            double screen_y = height - ((p.y - min_y) * scale_y + padding);
+            double screen_x = center_x + (p.x * scale_x);
+            double screen_y = center_y - (p.y * scale_y);
             
-            // rectangle starts at top-left corner, so we need to adjust
-            cr->rectangle(screen_x - 5, screen_y - 5, 10, 10);
+            // 'rectangle' starts at top-left corner, so we need to adjust
+            cr->rectangle(screen_x - 4, screen_y - 4, 8, 8);  // 8x8 square
             cr->fill();
         }
+    }
+
+
+    // helper methods for drawing labels
+    void draw_XLabels(const Cairo::RefPtr<Cairo::Context>& cr, double screen_x, double center_y, double x){
+        cr->set_font_size(12);
+        cr->set_source_rgb(0.0, 0.0, 0.0);  // Black color
+        cr->move_to(screen_x + 2, center_y + 12);  // Adjusted by trial and error for better visibility
+        cr->show_text(std::to_string((int)x));
+        
+        cr->set_source_rgba(0.3, 0.3, 0.3, 0.5);  // Reset color for grid lines
+    }
+    void draw_YLabels(const Cairo::RefPtr<Cairo::Context>& cr, double center_x, double screen_y, double y){
+        cr->set_font_size(12);
+        cr->set_source_rgb(0.0, 0.0, 0.0);  // Black color
+        cr->move_to(center_x + 3, screen_y - 3);  // Adjusted by trial and error for better visibility
+        cr->show_text(std::to_string((int)y));
+
+        cr->set_source_rgba(0.3, 0.3, 0.3, 0.5);  // Reset color for grid lines
     }
 };
 
@@ -237,7 +314,7 @@ protected:
         
         ClusterData data; // Instantiated ClusterData object
         
-        if (data.load_from_file("dataPoints2.txt")) {
+        if (data.load_from_file("negatives.txt")) {
             std::cout << "File loaded successfully" << std::endl;
             drawingArea.set_data(data);
         } else {
