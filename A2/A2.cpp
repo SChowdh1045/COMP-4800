@@ -99,6 +99,7 @@ public:
 
 class SolarSystem : public Gtk::DrawingArea {
 private:
+    double sun_luminosity = 0.0;  // to track sun's brightness oscillation
     std::vector<Star> stars;
     std::vector<Planet> planets;
     std::vector<Asteroid> asteroids;
@@ -212,8 +213,11 @@ private:
             s.draw(cr);
         }
 
-        // Draw sun
-        cr->set_source_rgb(1.0, 0.8, 0.0);  // Yellow sun
+        // Draw sun with oscillating brightness
+        double base_brightness = 0.8;  // Base yellow component
+        double brightness_variation = 0.04;  // How much the brightness varies
+        double current_brightness = base_brightness + sin(sun_luminosity) * brightness_variation;
+        cr->set_source_rgb(1.0, current_brightness, 0.0);  // Varying yellow component
         cr->arc(center_x, center_y, 20, 0, 2 * M_PI);
         cr->fill();
 
@@ -230,6 +234,12 @@ private:
 
 
     bool trigger_draw() {
+        // Update sun luminosity
+        sun_luminosity += 0.33;  // Speed of oscillation
+        if (sun_luminosity > 2 * M_PI) {
+            sun_luminosity -= 2 * M_PI;  // Reset to keep value in reasonable range
+        }
+
         // Update planet positions
         for (auto& p : planets) {
             p.update();
