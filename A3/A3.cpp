@@ -32,7 +32,7 @@ public:
         }
         std::cout << "Expected number of points: " << n_points << std::endl;
 
-        // Read data points coordinates
+        // Read data point coordinates
         points.clear();
         for (int i = 0; i < n_points; i++) {
             double x, y;
@@ -137,7 +137,7 @@ private:
     bool is_running;
     std::vector<Point> old_centroids;
     sigc::connection timer_connection;
-    Gtk::Entry* speed_entry;         // Change from Scale to Entry
+    Gtk::Scale* speed_slider;
     Gtk::Label* iteration_label;
 
     // Checking for convergence
@@ -190,12 +190,19 @@ public:
         
         // Calculate scales once and store them
         calculate_scales(get_width(), get_height());
+
+        // When I press reset, I want the centroids to go back to their original positions (see the last for-loop in on_draw)
+        old_centroids.clear();
+
+        // Reset iteration count
+        current_iteration = 0;
+        iteration_label->set_markup("<span font='20' weight='bold'>Iteration: 0</span>");
         
         queue_draw();
     }
 
-    void set_controls(Gtk::Entry* entry, Gtk::Label* label) {
-        speed_entry = entry;
+    void set_controls(Gtk::Scale* slider, Gtk::Label* label) {
+        speed_slider = slider;
         iteration_label = label;
     }
 
@@ -203,8 +210,10 @@ public:
         if (!is_running) {
             is_running = true;
             cluster_data.assign_clusters();
-            iteration_label->set_text("Iteration: " + std::to_string(1));
-            on_timer();  // Start animation immediately
+            
+            iteration_label->set_markup("<span font='20' weight='bold'>Iteration: 1</span>");
+            
+            on_timer();  // Starts animation immediately
             // schedule_next_frame() is called at the end of on_timer()
         }
     }
@@ -263,7 +272,7 @@ public:
         stored_max_y = max_extent_y;
 
         // Store padding and calculate available space
-        stored_padding = 50;
+        stored_padding = 35;
         double available_width = width - (2 * stored_padding);
         double available_height = height - (2 * stored_padding);
 
@@ -278,6 +287,41 @@ public:
         // Store center coordinates
         stored_center_x = stored_quadrant_width + stored_padding;
         stored_center_y = stored_quadrant_height + stored_padding;
+    }
+
+    std::vector<std::array<double, 3>> generate_colors(int num_clusters) {
+        std::vector<std::array<double, 3>> colors;
+        
+        for (int i = 0; i < num_clusters; i++) {
+            // Distribute hue evenly around the color wheel (0 to 360 degrees)
+            double hue = (360.0 * i) / num_clusters;
+            double saturation = 1.0;  // Full saturation
+            double value = 1.0;       // Full brightness
+
+            // Convert HSV to RGB
+            double c = value * saturation;
+            double x = c * (1 - std::abs(std::fmod(hue / 60.0, 2) - 1));
+            double m = value - c;
+
+            double r, g, b;
+            if (hue >= 0 && hue < 60) {
+                r = c; g = x; b = 0;
+            } else if (hue >= 60 && hue < 120) {
+                r = x; g = c; b = 0;
+            } else if (hue >= 120 && hue < 180) {
+                r = 0; g = c; b = x;
+            } else if (hue >= 180 && hue < 240) {
+                r = 0; g = x; b = c;
+            } else if (hue >= 240 && hue < 300) {
+                r = x; g = 0; b = c;
+            } else {
+                r = c; g = 0; b = x;
+            }
+
+            colors.push_back({r + m, g + m, b + m});
+        }
+        
+        return colors;
     }
 
 
@@ -320,10 +364,6 @@ protected:
 
         double x_interval = calculate_grid_interval(max_x);
         double y_interval = calculate_grid_interval(max_y);
-
-        // Center point (origin) in screen coordinates
-        // double center_x = quadrant_width + padding;  // quadrant_width = available_width / 2
-        // double center_y = quadrant_height + padding;  // quadrant_height = available_height / 2
 
         cr->set_source_rgba(0.3, 0.3, 0.3, 0.5);  // Gray color
         cr->set_line_width(0.5);
@@ -391,14 +431,15 @@ protected:
         cr->stroke();
 
 
-        // K-MEANS
+        // K-MEANS //
+
         // Generate colors based on number of centroids
         const auto colors = generate_colors(cluster_data.centroids.size());
 
         // Draw points
         for (size_t i = 0; i < cluster_data.points.size(); i++) {
             int cluster = cluster_data.point_clusters[i];
-            auto& color = colors[cluster % colors.size()];
+            auto& color = colors[cluster];
             cr->set_source_rgb(color[0], color[1], color[2]);
             
             double screen_x = center_x + (cluster_data.points[i].x * scale_x);
@@ -428,7 +469,7 @@ protected:
 
             // Draw black circle outline
             cr->set_source_rgb(0.0, 0.0, 0.0);  // Black
-            cr->arc(screen_x, screen_y, 12, 0, 2 * M_PI);  // Slightly larger radius
+            cr->arc(screen_x, screen_y, 14, 0, 2 * M_PI);  // Slightly larger radius
             cr->stroke();
 
             // Draw colored square
@@ -458,48 +499,12 @@ protected:
     }
 
 
-    std::vector<std::array<double, 3>> generate_colors(int num_clusters) {
-        std::vector<std::array<double, 3>> colors;
-        
-        for (int i = 0; i < num_clusters; i++) {
-            // Distribute hue evenly around the color wheel (0 to 360 degrees)
-            double hue = (360.0 * i) / num_clusters;
-            double saturation = 1.0;  // Full saturation
-            double value = 1.0;       // Full brightness
-
-            // Convert HSV to RGB
-            double c = value * saturation;
-            double x = c * (1 - std::abs(std::fmod(hue / 60.0, 2) - 1));
-            double m = value - c;
-
-            double r, g, b;
-            if (hue >= 0 && hue < 60) {
-                r = c; g = x; b = 0;
-            } else if (hue >= 60 && hue < 120) {
-                r = x; g = c; b = 0;
-            } else if (hue >= 120 && hue < 180) {
-                r = 0; g = c; b = x;
-            } else if (hue >= 180 && hue < 240) {
-                r = 0; g = x; b = c;
-            } else if (hue >= 240 && hue < 300) {
-                r = x; g = 0; b = c;
-            } else {
-                r = c; g = 0; b = x;
-            }
-
-            colors.push_back({r + m, g + m, b + m});
-        }
-        
-        return colors;
-    }
-
-
     // Timer callback for K-MEANS animation
     void schedule_next_frame() {
         if (!is_running) return;
         
         try {
-            int fps = std::stoi(speed_entry->get_text());  // stoi means string to integer
+            int fps = static_cast<int>(speed_slider->get_value());
             if (fps <= 0) {
                 std::cerr << "FPS must be positive" << std::endl;
                 is_running = false;
@@ -536,14 +541,14 @@ protected:
                 // Check for convergence
                 if (hasConverged(cluster_data.centroids, new_positions)) {
                     is_running = false;
-                    iteration_label->set_text("Converged at iteration: " + std::to_string(current_iteration));
+                    iteration_label->set_markup("<span font='20' weight='bold'>Converged at iteration: " + std::to_string(current_iteration) + "</span>");
                     return false;
                 }
 
                 cluster_data.centroids = new_positions;
 
                 current_iteration++;
-                iteration_label->set_text("Iteration: " + std::to_string(current_iteration));
+                iteration_label->set_markup("<span font='20' weight='bold'>Iteration: " + std::to_string(current_iteration) + "</span>");
             } else {
                 // Second: Finish centroid movement phase
                 old_centroids.clear();
@@ -561,62 +566,85 @@ protected:
 class MainWindow : public Gtk::Window {
 private:
     DrawingArea_ drawingArea;
+    ClusterData data;
 
     Gtk::Box vbox;
     Gtk::Button start_button;
     Gtk::Button reset_button;
-    Gtk::Entry speed_entry;  // Replace Gtk::Scale with Gtk::Entry
+    Gtk::Scale speed_slider;
     Gtk::Label iteration_label;
     Gtk::Label speed_label;  // Add a label to explain the entry
 
 public:
-    MainWindow() {
+    MainWindow() : speed_slider(Gtk::Orientation::HORIZONTAL) {
         set_title("K-Means Clustering Animation");
         set_default_size(800, 600);
 
         vbox.set_orientation(Gtk::Orientation::VERTICAL);
+        vbox.set_margin(10);  // Add margin around everything
         set_child(vbox);
 
-        // Controls box
+        // Top controls box
         auto controls = Gtk::Box(Gtk::Orientation::HORIZONTAL);
-        
-        load_data();
+        controls.set_margin(5);  // Margin around control box
+        // controls.set_spacing(20);  // Space between controls
 
+        // Left side - Start button
         start_button.set_label("Start Animation");
         start_button.signal_clicked().connect(
             sigc::mem_fun(*this, &MainWindow::on_start_clicked));
+        start_button.set_margin(5);
         controls.append(start_button);
 
+        // Middle - Speed control
+        auto speed_box = Gtk::Box(Gtk::Orientation::HORIZONTAL);
+        speed_box.set_margin_start(50);
+        speed_box.set_hexpand(true);
+        speed_box.set_halign(Gtk::Align::CENTER);  // Center in the expanded space
+        
         speed_label.set_text("Animation Speed (FPS):");
-        controls.append(speed_label);
+        speed_box.append(speed_label);
 
-        speed_entry.set_width_chars(5);  // Make the entry box smaller
-        speed_entry.set_text("10");      // 15 FPS by default
-        controls.append(speed_entry);
+        speed_slider.set_range(1, 60);
+        speed_slider.set_value(10);
+        speed_slider.set_size_request(200, -1);  // Make slider wider
+        speed_slider.set_draw_value(true);
+        speed_slider.set_digits(0);
+        speed_box.append(speed_slider);
 
-        iteration_label.set_text("Iteration: 0");
-        controls.append(iteration_label);
+        controls.append(speed_box);
 
+        // Right side - Reset button with margin-left:auto to push it right
         reset_button.set_label("Reset");
         reset_button.signal_clicked().connect(
             sigc::mem_fun(*this, &MainWindow::load_data));
+        reset_button.set_margin(5);
+        reset_button.set_hexpand(true);  // Allow horizontal expansion
+        reset_button.set_halign(Gtk::Align::END);  // Align to the right
         controls.append(reset_button);
 
         vbox.append(controls);
+
+        // Main drawing area
         vbox.append(drawingArea);
 
-        drawingArea.set_controls(&speed_entry, &iteration_label);
+        // Bottom - Iteration label
+        // iteration_label.set_text("Iteration: 0");
+        iteration_label.set_margin(10);
+        iteration_label.set_margin_start(20);
+        iteration_label.set_markup("<span font='20' weight='bold'>Iteration: 0</span>");
+        vbox.append(iteration_label);
+
+        drawingArea.set_controls(&speed_slider, &iteration_label);
+
+        load_data();
     }
 
 protected:
     void load_data() {
         drawingArea.stopRunning();
 
-        ClusterData data;
-        data.points.clear();
-        data.centroids.clear();
-
-        if (data.load_from_file("negatives.txt")) {
+        if (data.load_from_file("main.txt")) {
             drawingArea.set_data(data);
             start_button.set_sensitive(true);
         }
