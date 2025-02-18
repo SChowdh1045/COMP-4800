@@ -1,10 +1,7 @@
 #include <gtkmm.h>
-#include <cairomm/context.h>
-#include <cairomm/surface.h>
 #include <iostream>
-#include <filesystem>
-#include <cstring>
 
+// FFmpeg includes
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -12,253 +9,52 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-bool save_frame_as_png(const uint8_t* rgb_data, int width, int height, 
-                      const char* filename, bool grayscale = false,
-                      float r_coeff = 0.0f, float g_coeff = 0.0f, float b_coeff = 0.0f) {
-    auto surface = Cairo::ImageSurface::create(Cairo::Surface::Format::RGB24, width, height);
-    auto cr = Cairo::Context::create(surface);
-    
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int src_pos = (y * width + x) * 3;
-            if (grayscale) {
-                uint8_t gray = static_cast<uint8_t>(
-                    r_coeff * rgb_data[src_pos] +
-                    g_coeff * rgb_data[src_pos + 1] +
-                    b_coeff * rgb_data[src_pos + 2]
-                );
-                cr->set_source_rgb(gray/255.0, gray/255.0, gray/255.0);
-            } else {
-                cr->set_source_rgb(
-                    rgb_data[src_pos]/255.0,
-                    rgb_data[src_pos + 1]/255.0,
-                    rgb_data[src_pos + 2]/255.0
-                );
-            }
-            cr->rectangle(x, y, 1, 1);
-            cr->fill();
-        }
-    }
-    
-    try {
-        surface->write_to_png(filename);
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "Error saving PNG: " << e.what() << std::endl;
+bool save_frame_as_ppm(const uint8_t* rgb_data, int width, int height, const char* filename) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) {
+        std::cerr << "Could not open " << filename << std::endl;
         return false;
     }
+
+    fprintf(fp, "P6\n%d %d\n255\n", width, height);
+    fwrite(rgb_data, 1, width * height * 3, fp);
+    fclose(fp);
+    return true;
 }
 
-class FrameViewer : public Gtk::Window {
-private:
-    Gtk::Box m_box{Gtk::Orientation::HORIZONTAL};
-    Gtk::Box m_color_box{Gtk::Orientation::VERTICAL};
-    Gtk::Box m_gray_box{Gtk::Orientation::VERTICAL};
-    Gtk::Image m_color_image;
-    Gtk::Image m_gray_image;
-    Gtk::Label m_color_label{"Color Frame"};
-    Gtk::Label m_gray_label{"Grayscale Frame"};
+bool save_frame_as_pgm(const uint8_t* rgb_data, int width, int height, 
+                      float r_coeff, float g_coeff, float b_coeff, 
+                      const char* filename) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) {
+        std::cerr << "Could not open " << filename << std::endl;
+        return false;
+    }
+
+    fprintf(fp, "P5\n%d %d\n255\n", width, height);
     
-    Glib::RefPtr<Gdk::Pixbuf> m_color_pixbuf;
-    Glib::RefPtr<Gdk::Pixbuf> m_gray_pixbuf;
-
-protected:
-    void on_draw_color(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) {
-        if (m_color_pixbuf) {
-            double scale = std::min(
-                (double)width / m_color_pixbuf->get_width(),
-                (double)height / m_color_pixbuf->get_height()
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            int pos = (i * width + j) * 3;
+            uint8_t gray = static_cast<uint8_t>(
+                r_coeff * rgb_data[pos] +
+                g_coeff * rgb_data[pos + 1] +
+                b_coeff * rgb_data[pos + 2]
             );
-            cr->scale(scale, scale);
-            Gdk::Cairo::set_source_pixbuf(cr, m_color_pixbuf, 0, 0);
-            cr->paint();
+            fwrite(&gray, 1, 1, fp);
         }
     }
+    
+    fclose(fp);
+    return true;
+}
 
-    void on_draw_gray(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) {
-        if (m_gray_pixbuf) {
-            double scale = std::min(
-                (double)width / m_gray_pixbuf->get_width(),
-                (double)height / m_gray_pixbuf->get_height()
-            );
-            cr->scale(scale, scale);
-            Gdk::Cairo::set_source_pixbuf(cr, m_gray_pixbuf, 0, 0);
-            cr->paint();
-        }
-    }
 
-public:
-    FrameViewer() {
-        std::cout << "Creating Frame Viewer window..." << std::endl;
-        
-        set_title("Frame Viewer");
-        set_default_size(800, 600);
-
-        m_box.set_margin(10);
-        m_box.set_spacing(20);
-        set_child(m_box);
-
-        // Color frame section
-        std::cout << "Setting up color frame..." << std::endl;
-        m_color_box.append(m_color_label);
-        try {
-            std::cout << "Attempting to load frame_color.png..." << std::endl;
-            auto color_pixbuf = Gdk::Pixbuf::create_from_file("frame_color.png");
-            if (color_pixbuf) {
-                std::cout << "Successfully loaded color image" << std::endl;
-                int max_height = 500;
-                if (color_pixbuf->get_height() > max_height) {
-                    double scale = (double)max_height / color_pixbuf->get_height();
-                    auto scaled = color_pixbuf->scale_simple(
-                        color_pixbuf->get_width() * scale,
-                        max_height,
-                        Gdk::InterpType::BILINEAR
-                    );
-                    m_color_image.set(scaled);
-                } else {
-                    m_color_image.set(color_pixbuf);
-                }
-            }
-        }
-        catch (const Glib::Error& ex) {
-            std::cerr << "Error loading color image: " << ex.what() << std::endl;
-        }
-        m_color_box.append(m_color_image);
-
-        // Grayscale frame section
-        std::cout << "Setting up grayscale frame..." << std::endl;
-        m_gray_box.append(m_gray_label);
-        try {
-            std::cout << "Attempting to load frame_gray.png..." << std::endl;
-            auto gray_pixbuf = Gdk::Pixbuf::create_from_file("frame_gray.png");
-            if (gray_pixbuf) {
-                std::cout << "Successfully loaded grayscale image" << std::endl;
-                int max_height = 500;
-                if (gray_pixbuf->get_height() > max_height) {
-                    double scale = (double)max_height / gray_pixbuf->get_height();
-                    auto scaled = gray_pixbuf->scale_simple(
-                        gray_pixbuf->get_width() * scale,
-                        max_height,
-                        Gdk::InterpType::BILINEAR
-                    );
-                    m_gray_image.set(scaled);
-                } else {
-                    m_gray_image.set(gray_pixbuf);
-                }
-            }
-        }
-        catch (const Glib::Error& ex) {
-            std::cerr << "Error loading grayscale image: " << ex.what() << std::endl;
-        }
-        m_gray_box.append(m_gray_image);
-
-        m_box.append(m_color_box);
-        m_box.append(m_gray_box);
-        
-        std::cout << "Frame Viewer window setup complete" << std::endl;
-    }
-};
-
-// class FrameViewer : public Gtk::Window {
-// private:
-//     Gtk::Box m_box{Gtk::Orientation::HORIZONTAL};
-//     Gtk::Box m_color_box{Gtk::Orientation::VERTICAL};
-//     Gtk::Box m_gray_box{Gtk::Orientation::VERTICAL};
-//     Gtk::Image m_color_image;
-//     Gtk::Image m_gray_image;
-//     Gtk::Label m_color_label{"Color Frame"};
-//     Gtk::Label m_gray_label{"Grayscale Frame"};
-
-// public:
-//     FrameViewer() {
-//         std::cout << "Creating Frame Viewer window..." << std::endl;
-        
-//         set_title("Frame Viewer");
-//         set_default_size(800, 600);
-
-//         m_box.set_margin(10);
-//         m_box.set_spacing(20);
-//         set_child(m_box);
-
-//         // Color frame section
-//         std::cout << "Setting up color frame..." << std::endl;
-//         m_color_box.append(m_color_label);
-//         try {
-//             std::cout << "Attempting to load frame_color.png..." << std::endl;
-//             auto color_pixbuf = Gdk::Pixbuf::create_from_file("frame_color.png");
-//             if (color_pixbuf) {
-//                 std::cout << "Successfully loaded color image" << std::endl;
-//                 int max_height = 500;
-//                 if (color_pixbuf->get_height() > max_height) {
-//                     double scale = (double)max_height / color_pixbuf->get_height();
-//                     auto scaled = color_pixbuf->scale_simple(
-//                         color_pixbuf->get_width() * scale,
-//                         max_height,
-//                         Gdk::InterpType::BILINEAR
-//                     );
-//                     m_color_image.set(scaled);
-//                 } else {
-//                     m_color_image.set(color_pixbuf);
-//                 }
-//             }
-//         }
-//         catch (const Glib::Error& ex) {
-//             std::cerr << "Error loading color image: " << ex.what() << std::endl;
-//         }
-//         m_color_box.append(m_color_image);
-
-//         // Grayscale frame section
-//         std::cout << "Setting up grayscale frame..." << std::endl;
-//         m_gray_box.append(m_gray_label);
-//         try {
-//             std::cout << "Attempting to load frame_gray.png..." << std::endl;
-//             auto gray_pixbuf = Gdk::Pixbuf::create_from_file("frame_gray.png");
-//             if (gray_pixbuf) {
-//                 std::cout << "Successfully loaded grayscale image" << std::endl;
-//                 int max_height = 500;
-//                 if (gray_pixbuf->get_height() > max_height) {
-//                     double scale = (double)max_height / gray_pixbuf->get_height();
-//                     auto scaled = gray_pixbuf->scale_simple(
-//                         gray_pixbuf->get_width() * scale,
-//                         max_height,
-//                         Gdk::InterpType::BILINEAR
-//                     );
-//                     m_gray_image.set(scaled);
-//                 } else {
-//                     m_gray_image.set(gray_pixbuf);
-//                 }
-//             }
-//         }
-//         catch (const Glib::Error& ex) {
-//             std::cerr << "Error loading grayscale image: " << ex.what() << std::endl;
-//         }
-//         m_gray_box.append(m_gray_image);
-
-//         m_box.append(m_color_box);
-//         m_box.append(m_gray_box);
-        
-//         std::cout << "Frame Viewer window setup complete" << std::endl;
-//     }
-// };
-
-int main(int argc, char* argv[]) {
-    // Initialize Gtk before anything else
-    gtk_init();
-    std::cout << "GTK initialized" << std::endl;
-    if (argc != 6) {
-        std::cerr << "Usage: " << argv[0] << " <video_file> <frame_number> <r_coeff> <g_coeff> <b_coeff>" << std::endl;
-        return 1;
-    }
-
-    // Process arguments and extract frame
-    const char* filename = argv[1];
-    int target_frame = std::stoi(argv[2]);
-    float r_coeff = std::stof(argv[3]);
-    float g_coeff = std::stof(argv[4]);
-    float b_coeff = std::stof(argv[5]);
-
+// First: FFmpeg frame extraction function (completely separate from GTK)
+bool extract_frame(const char* filename, int target_frame, 
+                  float r_coeff, float g_coeff, float b_coeff) {
     std::cout << "Starting frame extraction..." << std::endl;
-
+    
     std::cout << "Opening: " << filename << ", frame: " << target_frame << std::endl;
 
     AVFormatContext* fmt_ctx = nullptr;
@@ -365,15 +161,10 @@ int main(int argc, char* argv[]) {
                     sws_scale(sws_ctx, frame->data, frame->linesize, 0, 
                              frame->height, rgb_frame->data, rgb_frame->linesize);
 
-                    // Save frames
-                    std::cout << "Saving color frame..." << std::endl;
-                    save_frame_as_png(rgb_buffer, frame->width, frame->height, 
-                                    "frame_color.png");
-                    
-                    std::cout << "Saving grayscale frame..." << std::endl;
-                    save_frame_as_png(rgb_buffer, frame->width, frame->height,
-                                    "frame_gray.png", true,
-                                    r_coeff, g_coeff, b_coeff);
+                    save_frame_as_ppm(rgb_buffer, frame->width, frame->height, 
+                                    "frame.ppm");
+                    save_frame_as_pgm(rgb_buffer, frame->width, frame->height,
+                                    r_coeff, g_coeff, b_coeff, "frame.pgm");
 
                     av_frame_free(&rgb_frame);
                     sws_freeContext(sws_ctx);
@@ -398,9 +189,114 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "Successfully saved frames as PNG" << std::endl;
-    std::cout << "Starting GTK application..." << std::endl;
+    std::cout << "Successfully saved frame as PPM and PGM" << std::endl;
+    
+    // Return true if files were saved successfully
+    return true;
+}
 
+// Second: GTK window class (unchanged from our working version)
+class FrameViewer : public Gtk::Window {
+private:
+    Gtk::Box m_box{Gtk::Orientation::HORIZONTAL};
+    Gtk::Box m_color_box{Gtk::Orientation::VERTICAL};
+    Gtk::Box m_gray_box{Gtk::Orientation::VERTICAL};
+    Gtk::Image m_color_image;
+    Gtk::Image m_gray_image;
+    Gtk::Label m_color_label{"Color Frame"};
+    Gtk::Label m_gray_label{"Grayscale Frame"};
+
+public:
+    FrameViewer() {
+        std::cout << "Creating Frame Viewer window..." << std::endl;
+        
+        set_title("Frame Viewer");
+        set_default_size(800, 600);
+
+        m_box.set_margin(10);
+        m_box.set_spacing(20);
+        set_child(m_box);
+
+        // Color frame section
+        std::cout << "Setting up color frame..." << std::endl;
+        m_color_box.append(m_color_label);
+        try {
+            std::cout << "Attempting to load frame.ppm..." << std::endl;
+            auto color_pixbuf = Gdk::Pixbuf::create_from_file("frame.ppm");
+            if (color_pixbuf) {
+                std::cout << "Successfully loaded color image" << std::endl;
+                // Scale to a reasonable size
+                int max_height = 500;
+                if (color_pixbuf->get_height() > max_height) {
+                    double scale = (double)max_height / color_pixbuf->get_height();
+                    auto scaled = color_pixbuf->scale_simple(
+                        color_pixbuf->get_width() * scale,
+                        max_height,
+                        Gdk::InterpType::BILINEAR
+                    );
+                    m_color_image.set(scaled);
+                } else {
+                    m_color_image.set(color_pixbuf);
+                }
+            }
+        }
+        catch (const Glib::Error& ex) {
+            std::cerr << "Error loading color image: " << ex.what() << std::endl;
+        }
+        m_color_box.append(m_color_image);
+
+        // Grayscale frame section
+        std::cout << "Setting up grayscale frame..." << std::endl;
+        m_gray_box.append(m_gray_label);
+        try {
+            std::cout << "Attempting to load frame.pgm..." << std::endl;
+            auto gray_pixbuf = Gdk::Pixbuf::create_from_file("frame.pgm");
+            if (gray_pixbuf) {
+                std::cout << "Successfully loaded grayscale image" << std::endl;
+                // Scale to match color image
+                int max_height = 500;
+                if (gray_pixbuf->get_height() > max_height) {
+                    double scale = (double)max_height / gray_pixbuf->get_height();
+                    auto scaled = gray_pixbuf->scale_simple(
+                        gray_pixbuf->get_width() * scale,
+                        max_height,
+                        Gdk::InterpType::BILINEAR
+                    );
+                    m_gray_image.set(scaled);
+                } else {
+                    m_gray_image.set(gray_pixbuf);
+                }
+            }
+        }
+        catch (const Glib::Error& ex) {
+            std::cerr << "Error loading grayscale image: " << ex.what() << std::endl;
+        }
+        m_gray_box.append(m_gray_image);
+
+        m_box.append(m_color_box);
+        m_box.append(m_gray_box);
+        
+        std::cout << "Frame Viewer window setup complete" << std::endl;
+    }
+};
+
+
+int main(int argc, char* argv[]) {
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0] << " <video_file> <frame_number> <r_coeff> <g_coeff> <b_coeff>" << std::endl;
+        return 1;
+    }
+
+    // First phase: Extract frame using FFmpeg
+    if (!extract_frame(argv[1], std::stoi(argv[2]), 
+                      std::stof(argv[3]), std::stof(argv[4]), std::stof(argv[5]))) {
+        std::cerr << "Frame extraction failed" << std::endl;
+        return 1;
+    }
+
+    std::cout << "Frame extraction complete, starting GTK application..." << std::endl;
+
+    // Second phase: GTK display (exactly as in our working version)
     auto app = Gtk::Application::create("org.gtkmm.pixel.viewer");
     return app->make_window_and_run<FrameViewer>(argc, argv);
 }
@@ -411,3 +307,4 @@ int main(int argc, char* argv[]) {
 // Run with:
 // ./A6 <video_file> <frame_number> <r_coeff> <g_coeff> <b_coeff>
 // Example: ./A6 1.mp4 10 0.299 0.587 0.114
+
