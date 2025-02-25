@@ -273,15 +273,19 @@ public:
         set_title("Frame Viewer");
         set_default_size(1600, 900);
 
+        // Make the box expand and fill the available space
         m_box.set_margin(10);
         m_box.set_spacing(20);
+        m_box.set_expand(true);
         set_child(m_box);
 
-        // Setting up drawing areas
-        m_color_area.set_content_width(750);
-        m_color_area.set_content_height(750);
-        m_gray_area.set_content_width(750);
-        m_gray_area.set_content_height(750);
+        // Configure boxes to expand
+        m_color_box.set_expand(true);
+        m_gray_box.set_expand(true);
+        
+        // Remove fixed sizes and let DrawingAreas expand
+        m_color_area.set_expand(true);
+        m_gray_area.set_expand(true);
 
         // Setting up color image
         m_color_box.append(m_color_label);
@@ -334,13 +338,27 @@ public:
 protected:
     void on_draw_color(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) {
         if (m_color_pixbuf) {
-            // Scale image to fit while maintaining aspect ratio
-            double scale = std::min(
-                (double)width / m_color_pixbuf->get_width(),
-                (double)height / m_color_pixbuf->get_height()
-            );
+            // Calculate scaling factors
+            double img_aspect = (double)m_color_pixbuf->get_width() / m_color_pixbuf->get_height();
+            double area_aspect = (double)width / height;
             
-            cr->scale(scale, scale);
+            double scale_x, scale_y;
+            if (img_aspect > area_aspect) {
+                // Image is wider than area - fit to width
+                scale_x = (double)width / m_color_pixbuf->get_width();
+                scale_y = scale_x;
+            } else {
+                // Image is taller than area - fit to height
+                scale_y = (double)height / m_color_pixbuf->get_height();
+                scale_x = scale_y;
+            }
+
+            // Center the image
+            double offset_x = (width - m_color_pixbuf->get_width() * scale_x) / 2;
+            double offset_y = (height - m_color_pixbuf->get_height() * scale_y) / 2;
+
+            cr->translate(offset_x, offset_y);
+            cr->scale(scale_x, scale_y);
             Gdk::Cairo::set_source_pixbuf(cr, m_color_pixbuf, 0, 0);
             cr->paint();
         }
@@ -348,13 +366,25 @@ protected:
 
     void on_draw_gray(const Cairo::RefPtr<Cairo::Context>& cr, int width, int height) {
         if (m_gray_pixbuf) {
-            // Scale image to fit while maintaining aspect ratio
-            double scale = std::min(
-                (double)width / m_gray_pixbuf->get_width(),
-                (double)height / m_gray_pixbuf->get_height()
-            );
+            // Calculate scaling factors
+            double img_aspect = (double)m_gray_pixbuf->get_width() / m_gray_pixbuf->get_height();
+            double area_aspect = (double)width / height;
             
-            cr->scale(scale, scale);
+            double scale_x, scale_y;
+            if (img_aspect > area_aspect) {
+                scale_x = (double)width / m_gray_pixbuf->get_width();
+                scale_y = scale_x;
+            } else {
+                scale_y = (double)height / m_gray_pixbuf->get_height();
+                scale_x = scale_y;
+            }
+
+            // Center the image
+            double offset_x = (width - m_gray_pixbuf->get_width() * scale_x) / 2;
+            double offset_y = (height - m_gray_pixbuf->get_height() * scale_y) / 2;
+
+            cr->translate(offset_x, offset_y);
+            cr->scale(scale_x, scale_y);
             Gdk::Cairo::set_source_pixbuf(cr, m_gray_pixbuf, 0, 0);
             cr->paint();
         }
@@ -363,11 +393,6 @@ protected:
 
 
 int main(int argc, char* argv[]) {
-    std::cout << "GTK compile-time version: "
-              << GTK_MAJOR_VERSION << "."
-              << GTK_MINOR_VERSION << "."
-              << GTK_MICRO_VERSION << std::endl;
-
     if (argc != 6) {
         std::cerr << "Usage: " << argv[0] << " <video_file> <frame_number> <r_coeff> <g_coeff> <b_coeff>" << std::endl;
         return 1;
@@ -393,8 +418,6 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "Frames extracted successfully. Size: " << frames.width << "x" << frames.height << std::endl;
-    std::cout << "Color data size: " << frames.color_data.size() << std::endl;
-    std::cout << "Gray data size: " << frames.gray_data.size() << std::endl;
 
     // Create new argc/argv for GTK with just the program name
     // This is to fix the bug where it says: GLib-GIO-CRITICAL **: 01:33:48.773: This application can not open files.
@@ -435,3 +458,4 @@ int main(int argc, char* argv[]) {
 // Run with:
 // ./A6 <video_file> <frame_number> <r_coeff> <g_coeff> <b_coeff>
 // Example: ./A6 1.mp4 10 0.299 0.587 0.114
+// Another example: ./A6 2.mp4 100 0.2126 0.7152 0.0722
