@@ -145,7 +145,7 @@ private:
                         }
 
                         uint8_t* rgb_ptrs[4] = { rgb_data.get(), nullptr, nullptr, nullptr };
-                        int rgb_linesizes[4] = { width * 3, 0, 0, 0 };
+                        int rgb_linesizes[4] = { 3 * width, 0, 0, 0 };
                         sws_scale(sws_ctx, frame->data, frame->linesize, 0,
                                 height, rgb_ptrs, rgb_linesizes);
 
