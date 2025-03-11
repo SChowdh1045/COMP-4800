@@ -1,15 +1,15 @@
 /**
     * A7.c - Video Player with GTK4 and FFmpeg
-    * 
+    
     * This program plays a video file using FFmpeg for decoding and GTK4 for display.
     * It utilizes pthreads for decoding and a GTK timer for displaying frames.
     * Frame rate can be specified as a command line argument.
-    *
+    
     * Compilation:
-    * gcc A7.c -o A7 `pkg-config --cflags --libs gtk4` -lavformat -lavcodec -lavutil -lswscale -pthread
-    * 
+    gcc A7.c -o A7 `pkg-config --cflags --libs gtk4` -lavformat -lavcodec -lavutil -lswscale -pthread
+    
     * Usage: ./A7 <video_file> <frame_rate>
-    * Example: ./A7 1.mp4 60
+    * Example: ./A7 2.mp4 60
 */
 
 #include <stdio.h>
