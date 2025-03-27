@@ -35,8 +35,6 @@
 // Waveform types
 typedef enum {
     SINE_WAVE,
-    SQUARE_WAVE,
-    SAWTOOTH_WAVE,
     NOISE
 } WaveformType;
 
@@ -53,25 +51,16 @@ float amplitude = 0.8f;  // 80% volume
 int deviceSampleRate = 44100;  // Will store actual device rate
 int bitsPerSample = 16;
 
-// Generate audio sample
+
+// Generates audio sample
 float generateSample(int sampleIndex, WaveformType waveform, float freq, float amp) {
-    float t = (float)sampleIndex / deviceSampleRate;  // Use actual device rate
+    float t = (float)sampleIndex / deviceSampleRate;  // Uses actual device rate
     float value = 0.0f;
     
     switch (waveform) {
         case SINE_WAVE:
             // Simple sine wave: amp * sin(2π * freq * t)
             value = amp * sinf(2.0f * M_PI * freq * t);
-            break;
-            
-        case SQUARE_WAVE:
-            // Square wave: amp * sign(sin(2π * freq * t))
-            value = amp * (sinf(2.0f * M_PI * freq * t) >= 0 ? 1.0f : -1.0f);
-            break;
-            
-        case SAWTOOTH_WAVE:
-            // Sawtooth wave: amp * (2 * (t * freq - floor(0.5 + t * freq)))
-            value = amp * (2.0f * (t * freq - floorf(0.5f + t * freq)));
             break;
             
         case NOISE:
@@ -83,7 +72,8 @@ float generateSample(int sampleIndex, WaveformType waveform, float freq, float a
     return value;
 }
 
-// Convert float audio sample (-1.0 to 1.0) to 16-bit PCM
+
+// Converts float audio sample (-1.0 to 1.0) to 16-bit PCM
 SHORT floatToInt16(float sample) {
     // Ensure sample is in range [-1.0, 1.0]
     if (sample > 1.0f) sample = 1.0f;
@@ -119,9 +109,7 @@ DWORD WINAPI AudioThread(LPVOID lpParam) {
     }
     
     printf("Playing %s at %.1f Hz (press any key to stop)\n", 
-        (currentWaveform == SINE_WAVE ? "sine wave" : 
-         currentWaveform == SQUARE_WAVE ? "square wave" : 
-         currentWaveform == SAWTOOTH_WAVE ? "sawtooth wave" : "noise"),
+        (currentWaveform == SINE_WAVE ? "sine wave" : "noise"),
         frequency);
     
     // Main audio loop
@@ -236,7 +224,7 @@ HRESULT InitializeAudioClient() {
         goto cleanup;
     }
     
-    // ==== Display device properties as required by the assignment ====
+    // ==== Display device properties ====
     
     // 1. Get device ID
     hr = IMMDevice_GetId(pDevice, &deviceId);
@@ -420,11 +408,9 @@ void CleanupAudio() {
 void showMenu() {
     printf("\n==== Audio Demo Menu ====\n");
     printf("1: Play Sine Wave\n");
-    printf("2: Play Square Wave\n");
-    printf("3: Play Sawtooth Wave\n");
-    printf("4: Play White Noise\n");
-    printf("5: Change Frequency (currently %.1f Hz)\n", frequency);
-    printf("6: Change Amplitude (currently %.2f)\n", amplitude);
+    printf("2: Play White Noise\n");
+    printf("3: Change Frequency (currently %.1f Hz)\n", frequency);
+    printf("4: Change Amplitude (currently %.2f)\n", amplitude);
     printf("0: Quit\n");
     printf("Enter your choice: ");
 }
@@ -475,25 +461,13 @@ int main() {
                 hThread = CreateThread(NULL, 0, AudioThread, NULL, 0, &threadId);
                 break;
                 
-            case 2: // Square Wave
-                currentWaveform = SQUARE_WAVE;
-                isPlaying = TRUE;
-                hThread = CreateThread(NULL, 0, AudioThread, NULL, 0, &threadId);
-                break;
-                
-            case 3: // Sawtooth Wave
-                currentWaveform = SAWTOOTH_WAVE;
-                isPlaying = TRUE;
-                hThread = CreateThread(NULL, 0, AudioThread, NULL, 0, &threadId);
-                break;
-                
-            case 4: // White Noise
+            case 2: // White Noise
                 currentWaveform = NOISE;
                 isPlaying = TRUE;
                 hThread = CreateThread(NULL, 0, AudioThread, NULL, 0, &threadId);
                 break;
                 
-            case 5: // Change Frequency
+            case 3: // Change Frequency
                 printf("Enter new frequency (20-20000 Hz): ");
                 scanf_s("%f", &newFreq);
                 if (newFreq < 20) newFreq = 20;
@@ -501,7 +475,7 @@ int main() {
                 frequency = newFreq;
                 break;
                 
-            case 6: // Change Amplitude
+            case 4: // Change Amplitude
                 printf("Enter new amplitude (0.0-1.0): ");
                 scanf_s("%f", &newAmp);
                 if (newAmp < 0) newAmp = 0;
