@@ -1,6 +1,8 @@
 // Compile: make -f Makefile
-// Run: ./A9.exe pencil.wav
-// To convert to .wav: ffmpeg -i pencil.mp3 output.wav
+// Run: ./A9 pencil.wav
+//
+// To convert to .wav: ffmpeg -i input.mp3 output.wav
+// For MP3 support: ffmpeg -i input.mp3 -f wav - | ./A9 -
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +36,7 @@
 #define USING_NEW_FFMPEG_API (LIBAVCODEC_VERSION_MAJOR > 58)
 
 // Constants
-#define BUFFER_SIZE 16384  // Size of the circular buffer
+#define BUFFER_SIZE 32768  // Size of the circular buffer (increased for better performance)
 #define SAMPLE_RATE 44100
 #define CHANNELS 2
 #define LINE_WIDTH 2.0
@@ -56,7 +58,7 @@ typedef struct {
     pthread_cond_t not_empty;
 } CircularBuffer;
 
-// Drawing point structure
+// Point structure
 typedef struct {
     double x, y;
 } Point;
@@ -87,9 +89,10 @@ static double pencil_size = 2.0;
 #ifdef _WIN32
 // Windows audio variables
 static HWAVEOUT hWaveOut = NULL;
-static WAVEHDR waveHeader;
-static DWORD waveBufferSize = 16384;
-static LPBYTE waveBuffer = NULL;
+static WAVEHDR waveHeader[2];  // Double-buffering for smoother playback
+static int current_buffer = 0;
+static DWORD waveBufferSize = 8192;  // Larger buffer (compared to 4096) for smoother playback
+static LPBYTE waveBuffer[2] = {NULL, NULL};
 #else
 static snd_pcm_t *pcm_handle;
 #endif
@@ -173,15 +176,31 @@ static int read_from_buffer(CircularBuffer *buffer, uint8_t *data, size_t size) 
     while (bytes_read < size && keep_running) {
         if (buffer->size == 0) {
             // Buffer is empty, wait for data or fill with silence if needed
-            if (!keep_running) {
-                // Fill remaining with silence if shutting down
+            if (!keep_running || !is_audio_playing) {
+                // Fill remaining with silence if shutting down or not playing
                 memset(data + bytes_read, 0, size - bytes_read);
                 bytes_read = size;
                 break;
             }
             
             // Wait for data
-            pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+            struct timespec timeout;
+            clock_gettime(CLOCK_REALTIME, &timeout);
+            timeout.tv_nsec += 5000000;  // 5ms timeout for more responsive playback
+            if (timeout.tv_nsec >= 1000000000) {
+                timeout.tv_sec++;
+                timeout.tv_nsec -= 1000000000;
+            }
+            
+            int wait_result = pthread_cond_timedwait(&buffer->not_empty, &buffer->mutex, &timeout);
+            if (wait_result == ETIMEDOUT) {
+                // If timeout, fill a bit of silence but don't exit loop
+                size_t silence_size = size / 10;  // Fill 10% of requested size with silence
+                if (silence_size > 0) {
+                    memset(data + bytes_read, 0, silence_size);
+                    bytes_read += silence_size;
+                }
+            }
             continue;
         }
         
@@ -226,10 +245,30 @@ static void *audio_thread_func(void *arg) {
         goto cleanup;
     }
     
-    // Open the file
-    if (avformat_open_input(&format_ctx, audio_file, NULL, NULL) != 0) {
-        fprintf(stderr, "Could not open audio file %s\n", audio_file);
-        goto cleanup;
+    // Check for stdin input
+    if (strcmp(audio_file, "-") == 0) {
+        // Reading from stdin (pipe)
+        format_ctx->pb = avio_alloc_context(
+            av_malloc(4096), 4096, 0, stdin, 
+            NULL, NULL, NULL);
+        if (!format_ctx->pb) {
+            fprintf(stderr, "Failed to allocate AVIO context\n");
+            goto cleanup;
+        }
+        
+        // Open input from stdin
+        if (avformat_open_input(&format_ctx, "pipe:", NULL, NULL) != 0) {
+            fprintf(stderr, "Could not open stdin for reading\n");
+            goto cleanup;
+        }
+    } else {
+        // Open the file
+        fprintf(stderr, "Attempting to open audio file: '%s'\n", audio_file);
+
+        if (avformat_open_input(&format_ctx, audio_file, NULL, NULL) != 0) {
+            fprintf(stderr, "Could not open audio file %s\n", audio_file);
+            goto cleanup;
+        }
     }
     
     // Find stream information
@@ -275,6 +314,19 @@ static void *audio_thread_func(void *arg) {
     if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
         fprintf(stderr, "Could not open codec\n");
         goto cleanup;
+    }
+    
+    // Display audio information
+    printf("Audio Information:\n");
+    printf("  Format: %s\n", avcodec_get_name(codec_ctx->codec_id));
+    printf("  Sample Rate: %d Hz\n", codec_ctx->sample_rate);
+    printf("  Channels: %d\n", codec_ctx->ch_layout.nb_channels);
+    printf("  Sample Format: %s\n", av_get_sample_fmt_name(codec_ctx->sample_fmt));
+
+    // Ensure sample rate matching
+    printf("Resampling from %d Hz to %d Hz\n", codec_ctx->sample_rate, SAMPLE_RATE);
+    if (codec_ctx->sample_rate != SAMPLE_RATE) {
+        printf("Note: Resampling may affect audio quality/speed\n");
     }
     
     // Create resampler - Updated to handle newer FFmpeg versions
@@ -359,7 +411,7 @@ static void *audio_thread_func(void *arg) {
                             goto cleanup;
                         }
                         
-                        // Resample the audio
+                        // Resample the audio - improved quality settings
                         int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, codec_ctx->sample_rate) + frame->nb_samples,
                                                       SAMPLE_RATE, codec_ctx->sample_rate, AV_ROUND_UP);
                         
@@ -380,8 +432,10 @@ static void *audio_thread_func(void *arg) {
                             goto cleanup;
                         }
                         
-                        // Write resampled data to circular buffer
+                        // Calculate actual output size
                         size_t data_size = resampled * CHANNELS * sizeof(int16_t);
+                        
+                        // Write resampled data to circular buffer
                         write_to_buffer(&audio_buffer, resampled_data, data_size);
                         
                         free(resampled_data);
@@ -429,27 +483,34 @@ static void setup_audio_system(void) {
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize = 0;
 
-    // Create a buffer for audio data
-    waveBuffer = (LPBYTE)malloc(waveBufferSize);
-    if (!waveBuffer) {
-        fprintf(stderr, "Failed to allocate wave buffer\n");
-        return;
+    // Create buffers for double-buffering
+    for (int i = 0; i < 2; i++) {
+        waveBuffer[i] = (LPBYTE)malloc(waveBufferSize);
+        if (!waveBuffer[i]) {
+            fprintf(stderr, "Failed to allocate wave buffer %d\n", i);
+            return;
+        }
+        
+        // Initialize with silence
+        memset(waveBuffer[i], 0, waveBufferSize);
+        
+        // Initialize header
+        memset(&waveHeader[i], 0, sizeof(WAVEHDR));
+        waveHeader[i].lpData = (LPSTR)waveBuffer[i];
+        waveHeader[i].dwBufferLength = waveBufferSize;
+        waveHeader[i].dwFlags = 0;
     }
 
     // Open the device
     MMRESULT result = waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
         fprintf(stderr, "Failed to open WinMM audio device: %d\n", result);
-        free(waveBuffer);
-        waveBuffer = NULL;
+        for (int i = 0; i < 2; i++) {
+            free(waveBuffer[i]);
+            waveBuffer[i] = NULL;
+        }
         return;
     }
-
-    // Setup the wave header
-    memset(&waveHeader, 0, sizeof(WAVEHDR));
-    waveHeader.lpData = (LPSTR)waveBuffer;
-    waveHeader.dwBufferLength = waveBufferSize;
-    waveHeader.dwFlags = 0;
 
     // Create a thread for playback
     pthread_t playback_thread;
@@ -457,13 +518,15 @@ static void setup_audio_system(void) {
         fprintf(stderr, "Failed to create WinMM playback thread\n");
         waveOutClose(hWaveOut);
         hWaveOut = NULL;
-        free(waveBuffer);
-        waveBuffer = NULL;
+        for (int i = 0; i < 2; i++) {
+            free(waveBuffer[i]);
+            waveBuffer[i] = NULL;
+        }
         return;
     }
     pthread_detach(playback_thread);
 
-    printf("%s audio system initialized\n", AUDIO_SYSTEM);
+    printf("%s audio system initialized with double-buffering\n", AUDIO_SYSTEM);
 #else
     // ALSA setup
     int err;
@@ -506,46 +569,61 @@ static void setup_audio_system(void) {
 }
 
 #ifdef _WIN32
-// WinMM playback thread
+// WinMM playback thread with double-buffering
 static void *winmm_playback_thread(void *arg) {
     MMRESULT result;
     
     while (keep_running) {
         if (is_audio_playing) {
-            // Read data from circular buffer
-            int bytes_read = read_from_buffer(&audio_buffer, 
-                                            (uint8_t *)waveBuffer, 
-                                            waveBufferSize);
+            // Get the current buffer
+            WAVEHDR *header = &waveHeader[current_buffer];
             
-            if (bytes_read > 0) {
-                // Prepare the header
-                waveHeader.dwBufferLength = bytes_read;
-                result = waveOutPrepareHeader(hWaveOut, &waveHeader, sizeof(WAVEHDR));
-                if (result != MMSYSERR_NOERROR) {
-                    fprintf(stderr, "Failed to prepare wave header: %d\n", result);
+            // Check if we need to prepare a new buffer
+            if (!(header->dwFlags & WHDR_PREPARED) || (header->dwFlags & WHDR_DONE)) {
+                // Unprepare if it was previously prepared
+                if (header->dwFlags & WHDR_PREPARED) {
+                    result = waveOutUnprepareHeader(hWaveOut, header, sizeof(WAVEHDR));
+                    if (result != MMSYSERR_NOERROR) {
+                        fprintf(stderr, "Failed to unprepare wave header: %d\n", result);
+                    }
+                }
+                
+                // Read new data from circular buffer
+                int bytes_read = read_from_buffer(&audio_buffer, 
+                                            (uint8_t *)waveBuffer[current_buffer], 
+                                            waveBufferSize);
+                
+                if (bytes_read > 0) {
+                    // Update header with actual bytes read
+                    header->dwBufferLength = bytes_read;
+                    header->dwFlags = 0;
+                    
+                    // Prepare header
+                    result = waveOutPrepareHeader(hWaveOut, header, sizeof(WAVEHDR));
+                    if (result != MMSYSERR_NOERROR) {
+                        fprintf(stderr, "Failed to prepare wave header: %d\n", result);
+                        Sleep(10);
+                        continue;
+                    }
+                    
+                    // Write to device
+                    result = waveOutWrite(hWaveOut, header, sizeof(WAVEHDR));
+                    if (result != MMSYSERR_NOERROR) {
+                        fprintf(stderr, "Failed to write to audio device: %d\n", result);
+                        waveOutUnprepareHeader(hWaveOut, header, sizeof(WAVEHDR));
+                        Sleep(10);
+                        continue;
+                    }
+                    
+                    // Switch to next buffer
+                    current_buffer = (current_buffer + 1) % 2;
+                } else {
+                    // No data, sleep a bit
                     Sleep(10);
-                    continue;
                 }
-                
-                // Write to device
-                result = waveOutWrite(hWaveOut, &waveHeader, sizeof(WAVEHDR));
-                if (result != MMSYSERR_NOERROR) {
-                    fprintf(stderr, "Failed to write to audio device: %d\n", result);
-                    waveOutUnprepareHeader(hWaveOut, &waveHeader, sizeof(WAVEHDR));
-                    Sleep(10);
-                    continue;
-                }
-                
-                // Wait for playback to complete
-                while ((waveHeader.dwFlags & WHDR_DONE) == 0 && keep_running && is_audio_playing) {
-                    Sleep(10); // 10ms
-                }
-                
-                // Unprepare the header
-                waveOutUnprepareHeader(hWaveOut, &waveHeader, sizeof(WAVEHDR));
             } else {
-                // No data, sleep a bit
-                Sleep(10);
+                // Current buffer is still playing, sleep a bit
+                Sleep(1);
             }
         } else {
             // Not playing, sleep a bit
@@ -603,13 +681,21 @@ static void cleanup_audio_system(void) {
 #ifdef _WIN32
     if (hWaveOut) {
         waveOutReset(hWaveOut);
+        
+        // Clean up each buffer
+        for (int i = 0; i < 2; i++) {
+            if (waveHeader[i].dwFlags & WHDR_PREPARED) {
+                waveOutUnprepareHeader(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
+            }
+            
+            if (waveBuffer[i]) {
+                free(waveBuffer[i]);
+                waveBuffer[i] = NULL;
+            }
+        }
+        
         waveOutClose(hWaveOut);
         hWaveOut = NULL;
-    }
-    
-    if (waveBuffer) {
-        free(waveBuffer);
-        waveBuffer = NULL;
     }
 #else
     // ALSA cleanup
@@ -630,10 +716,22 @@ static void stop_audio(void) {
     is_audio_playing = 0;
 }
 
+// GTK4 helper for creating CSS providers
+static void load_css(void) {
+    GtkCssProvider *provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(provider,
+        "button.color-button { min-width: 30px; min-height: 30px; padding: 0; }\n"
+        "button.tool-button { padding: 5px; }\n");
+    gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+                                               GTK_STYLE_PROVIDER(provider),
+                                               GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
+}
+
 // Create a surface of the appropriate size
 static void create_surface(GtkWidget *widget) {
-    int width = gtk_widget_get_allocated_width(widget);
-    int height = gtk_widget_get_allocated_height(widget);
+    int width = gtk_widget_get_width(widget);
+    int height = gtk_widget_get_height(widget);
     
     // Create a new surface if needed
     if (surface) {
@@ -658,15 +756,12 @@ static void clear_surface(void) {
     lines = NULL;
 }
 
-// Configure event handler - create or resize surface 
-static gboolean on_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer data) {
+// Configure event handler (GTK4 style using the draw function)
+static void on_resize(GtkDrawingArea *area, int width, int height, gpointer data) {
     if (!surface) {
-        create_surface(widget);
+        create_surface(GTK_WIDGET(area));
     } else {
         // Resize surface
-        int width = gtk_widget_get_allocated_width(widget);
-        int height = gtk_widget_get_allocated_height(widget);
-        
         cairo_surface_t *new_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
         cairo_t *cr = cairo_create(new_surface);
         
@@ -679,17 +774,14 @@ static gboolean on_configure_event(GtkWidget *widget, GdkEventConfigure *event, 
         cairo_surface_destroy(surface);
         surface = new_surface;
     }
-    
-    return TRUE;
 }
 
-// Draw event handler
-static gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
-    // Draw the surface
-    cairo_set_source_surface(cr, surface, 0, 0);
-    cairo_paint(cr);
-    
-    return FALSE;
+// Draw function for GTK4
+static void draw_function(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data) {
+    if (surface) {
+        cairo_set_source_surface(cr, surface, 0, 0);
+        cairo_paint(cr);
+    }
 }
 
 // Add a line to the drawing
@@ -712,7 +804,7 @@ static void add_line(double x1, double y1, double x2, double y2, GdkRGBA color, 
         // For eraser, draw using a white stroke
         cairo_set_source_rgb(cr, 1, 1, 1);
     } else {
-        // Fixed GdkRGBA structure members
+        // Set the color
         cairo_set_source_rgba(cr, color.red, color.green, color.blue, color.alpha);
     }
     
@@ -727,40 +819,31 @@ static void add_line(double x1, double y1, double x2, double y2, GdkRGBA color, 
     cairo_destroy(cr);
 }
 
-// Button press event handler
-static gboolean on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer data) {
-    if (event->button == 1) { // Left button
-        // Start drawing
-        is_drawing = 1;
-        last_point.x = event->x;
-        last_point.y = event->y;
-        
-        // Play the appropriate sound
-        if (current_tool == TOOL_PENCIL) {
-            play_audio();
-        }
+// Mouse press handler for GTK4
+static void on_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer data) {
+    // Start drawing
+    is_drawing = 1;
+    last_point.x = x;
+    last_point.y = y;
+    
+    // Play the appropriate sound
+    if (current_tool == TOOL_PENCIL) {
+        play_audio();
     }
-    return TRUE;
 }
 
-// Button release event handler
-static gboolean on_button_release(GtkWidget *widget, GdkEventButton *event, gpointer data) {
-    if (event->button == 1) { // Left button
-        // Stop drawing
-        is_drawing = 0;
-        
-        // Stop all sounds
-        stop_audio();
-    }
-    return TRUE;
+// Mouse release handler for GTK4
+static void on_released(GtkGestureClick *gesture, int n_press, double x, double y, gpointer data) {
+    // Stop drawing
+    is_drawing = 0;
+    
+    // Stop all sounds
+    stop_audio();
 }
 
-// Motion event handler
-static gboolean on_motion_notify(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
+// Mouse motion handler for GTK4
+static void on_motion(GtkEventControllerMotion *motion, double x, double y, gpointer data) {
     if (is_drawing) {
-        double x = event->x;
-        double y = event->y;
-        
         // Calculate distance moved
         double dx = x - last_point.x;
         double dy = y - last_point.y;
@@ -780,16 +863,15 @@ static gboolean on_motion_notify(GtkWidget *widget, GdkEventMotion *event, gpoin
             last_point.y = y;
             
             // Request redraw
-            gtk_widget_queue_draw(widget);
+            gtk_widget_queue_draw(drawing_area);
         }
     }
-    
-    return TRUE;
 }
 
-// Key press event handler
-static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
-    switch (event->keyval) {
+// Key press handler for GTK4
+static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval, 
+                              guint keycode, GdkModifierType state, gpointer data) {
+    switch (keyval) {
         case GDK_KEY_p:
         case GDK_KEY_P:
             // Switch to pencil
@@ -798,6 +880,7 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer dat
             break;
             
         case GDK_KEY_e: 
+        case GDK_KEY_E:
             // Switch to eraser
             current_tool = TOOL_ERASER;
             printf("Switched to eraser\n");
@@ -807,12 +890,12 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer dat
         case GDK_KEY_C:
             // Clear drawing
             clear_surface();
-            gtk_widget_queue_draw(widget);
+            gtk_widget_queue_draw(drawing_area);
             printf("Cleared drawing\n");
             break;
             
         case GDK_KEY_1:
-            // Red color - fixed GdkRGBA structure
+            // Red color
             current_color.red = 1.0;
             current_color.green = 0.0;
             current_color.blue = 0.0;
@@ -821,7 +904,7 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer dat
             break;
             
         case GDK_KEY_2:
-            // Green color - fixed GdkRGBA structure
+            // Green color
             current_color.red = 0.0;
             current_color.green = 0.8;
             current_color.blue = 0.0;
@@ -830,7 +913,7 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer dat
             break;
             
         case GDK_KEY_3:
-            // Blue color - fixed GdkRGBA structure
+            // Blue color
             current_color.red = 0.0;
             current_color.green = 0.0;
             current_color.blue = 1.0;
@@ -839,7 +922,7 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer dat
             break;
             
         case GDK_KEY_4:
-            // Black color - fixed GdkRGBA structure
+            // Black color
             current_color.red = 0.0;
             current_color.green = 0.0;
             current_color.blue = 0.0;
@@ -873,75 +956,199 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer dat
                 printf("Eraser size: %.1f\n", eraser_size);
             }
             break;
+            
+        default:
+            return FALSE; // Event not handled
     }
     
-    return TRUE;
+    return TRUE; // Event handled
 }
 
 // Color button click handler
-static void on_color_button(GtkWidget *widget, gpointer data) {
-    const gchar *button_name = gtk_widget_get_name(widget);
+static void on_color_button_clicked(GtkWidget *widget, gpointer data) {
+    GdkRGBA *color = (GdkRGBA*)data;
+    current_color = *color;
     
-    if (g_strcmp0(button_name, "red_button") == 0) {
-        // Fixed GdkRGBA structure
-        current_color.red = 1.0;
-        current_color.green = 0.0;
-        current_color.blue = 0.0;
-        current_color.alpha = 1.0;
-    } else if (g_strcmp0(button_name, "green_button") == 0) {
-        // Fixed GdkRGBA structure
-        current_color.red = 0.0;
-        current_color.green = 0.8;
-        current_color.blue = 0.0;
-        current_color.alpha = 1.0;
-    } else if (g_strcmp0(button_name, "blue_button") == 0) {
-        // Fixed GdkRGBA structure
-        current_color.red = 0.0;
-        current_color.green = 0.0;
-        current_color.blue = 1.0;
-        current_color.alpha = 1.0;
-    } else if (g_strcmp0(button_name, "black_button") == 0) {
-        // Fixed GdkRGBA structure
-        current_color.red = 0.0;
-        current_color.green = 0.0;
-        current_color.blue = 0.0;
-        current_color.alpha = 1.0;
-    }
+    // Print the selected color
+    printf("Selected color: R=%.1f G=%.1f B=%.1f\n", 
+           current_color.red, current_color.green, current_color.blue);
 }
 
 // Tool button click handler
-static void on_tool_button(GtkWidget *widget, gpointer data) {
-    const gchar *button_name = gtk_widget_get_name(widget);
+static void on_tool_button_clicked(GtkWidget *widget, gpointer data) {
+    DrawingTool tool = GPOINTER_TO_INT(data);
+    current_tool = tool;
     
-    if (g_strcmp0(button_name, "pencil_button") == 0) {
-        current_tool = TOOL_PENCIL;
+    if (tool == TOOL_PENCIL) {
         printf("Switched to pencil\n");
-    } else if (g_strcmp0(button_name, "eraser_button") == 0) {
-        current_tool = TOOL_ERASER;
+    } else {
         printf("Switched to eraser\n");
     }
 }
 
-// Helper function to draw color swatches
-static gboolean on_draw_color(GtkWidget *widget, cairo_t *cr, gpointer data);
+// Clear button click handler
+static void on_clear_button_clicked(GtkWidget *widget, gpointer data) {
+    clear_surface();
+    gtk_widget_queue_draw(drawing_area);
+    printf("Cleared drawing\n");
+}
 
-static gboolean on_draw_color(GtkWidget *widget, cairo_t *cr, gpointer data) {
-    uintptr_t color_val = (uintptr_t)data;
-    double r = ((color_val >> 24) & 0xFF) / 255.0;
-    double g = ((color_val >> 16) & 0xFF) / 255.0;
-    double b = ((color_val >> 8) & 0xFF) / 255.0;
-    double a = (color_val & 0xFF) / 255.0;
+// Exit handler for the GTK4 application
+static void on_app_shutdown(GApplication *app, gpointer user_data) {
+    // Stop the audio thread before exiting
+    keep_running = 0;
+    pthread_join(audio_thread, NULL);
+    cleanup_audio_system();
+}
+
+// Create a color button with custom styling
+static GtkWidget* create_color_button(GdkRGBA color) {
+    GtkWidget *button = gtk_button_new();
     
-    cairo_set_source_rgba(cr, r, g, b, a);
-    cairo_rectangle(cr, 0, 0, gtk_widget_get_allocated_width(widget), gtk_widget_get_allocated_height(widget));
-    cairo_fill(cr);
+    // Store the color as user data
+    GdkRGBA *color_data = g_new(GdkRGBA, 1);
+    *color_data = color;
+    g_object_set_data_full(G_OBJECT(button), "color", color_data, g_free);
     
-    return FALSE;
+    // Set button style classes
+    gtk_widget_add_css_class(button, "color-button");
+    
+    // Create a color swatch
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_size_request(box, 24, 24);
+    
+    // Set background color
+    GtkCssProvider *provider = gtk_css_provider_new();
+    
+    char css[100];
+    snprintf(css, sizeof(css),
+             "box { background-color: rgba(%.3f, %.3f, %.3f, %.3f); }",
+             color.red, color.green, color.blue, color.alpha);
+    
+    gtk_css_provider_load_from_string(provider, css);
+    GdkDisplay *display = gtk_widget_get_display(box);
+    gtk_style_context_add_provider_for_display(display, GTK_STYLE_PROVIDER(provider), 
+                                          GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
+    
+    gtk_button_set_child(GTK_BUTTON(button), box);
+    
+    // Connect click handler
+    g_signal_connect(button, "clicked", G_CALLBACK(on_color_button_clicked), color_data);
+    
+    return button;
 }
 
 
+// Add this function to handle the 'activate' signal
+static void activate(GtkApplication *app, gpointer user_data) {
+    GtkWidget *window;
+    GtkWidget *vbox, *toolbar;
+    GtkWidget *pencil_button, *eraser_button;
+    GtkWidget *clear_button;
+    GtkWidget *color_label;
+    GtkWidget *red_button, *green_button, *blue_button, *black_button;
+    GtkGesture *click_gesture;
+    GtkEventController *motion_controller, *key_controller;
+
+    // Load CSS styles
+    load_css();
+    
+    // Create the main window
+    window = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(window), "Sound-Based Drawing App");
+    gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);
+    
+    // Create a vertical box layout
+    vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_window_set_child(GTK_WINDOW(window), vbox);
+    
+    // Create toolbar for controls
+    toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_widget_set_margin_start(toolbar, 5);
+    gtk_widget_set_margin_end(toolbar, 5);
+    gtk_widget_set_margin_top(toolbar, 5);
+    gtk_widget_set_margin_bottom(toolbar, 5);
+    gtk_box_append(GTK_BOX(vbox), toolbar);
+    
+    // Create tool buttons
+    pencil_button = gtk_button_new_with_label("Pencil");
+    gtk_widget_add_css_class(pencil_button, "tool-button");
+    g_signal_connect(pencil_button, "clicked", G_CALLBACK(on_tool_button_clicked), 
+                    GINT_TO_POINTER(TOOL_PENCIL));
+    gtk_box_append(GTK_BOX(toolbar), pencil_button);
+    
+    eraser_button = gtk_button_new_with_label("Eraser");
+    gtk_widget_add_css_class(eraser_button, "tool-button");
+    g_signal_connect(eraser_button, "clicked", G_CALLBACK(on_tool_button_clicked), 
+                    GINT_TO_POINTER(TOOL_ERASER));
+    gtk_box_append(GTK_BOX(toolbar), eraser_button);
+    
+    // Color label
+    color_label = gtk_label_new("Colors:");
+    gtk_box_append(GTK_BOX(toolbar), color_label);
+    
+    // Create color buttons
+    GdkRGBA red_color = {1.0, 0.0, 0.0, 1.0};
+    red_button = create_color_button(red_color);
+    gtk_box_append(GTK_BOX(toolbar), red_button);
+    
+    GdkRGBA green_color = {0.0, 0.8, 0.0, 1.0};
+    green_button = create_color_button(green_color);
+    gtk_box_append(GTK_BOX(toolbar), green_button);
+    
+    GdkRGBA blue_color = {0.0, 0.0, 1.0, 1.0};
+    blue_button = create_color_button(blue_color);
+    gtk_box_append(GTK_BOX(toolbar), blue_button);
+    
+    GdkRGBA black_color = {0.0, 0.0, 0.0, 1.0};
+    black_button = create_color_button(black_color);
+    gtk_box_append(GTK_BOX(toolbar), black_button);
+    
+    // Create clear button (on the right side)
+    clear_button = gtk_button_new_with_label("Clear");
+    gtk_widget_set_hexpand(clear_button, TRUE);
+    gtk_widget_set_halign(clear_button, GTK_ALIGN_END);
+    g_signal_connect(clear_button, "clicked", G_CALLBACK(on_clear_button_clicked), NULL);
+    gtk_box_append(GTK_BOX(toolbar), clear_button);
+    
+    // Create drawing area
+    drawing_area = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(drawing_area, TRUE);
+    gtk_widget_set_vexpand(drawing_area, TRUE);
+    gtk_box_append(GTK_BOX(vbox), drawing_area);
+    
+    // Set up drawing area
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(drawing_area), draw_function, NULL, NULL);
+    
+    // Connect resize callback
+    g_signal_connect(drawing_area, "resize", G_CALLBACK(on_resize), NULL);
+    
+    // Set up gestures and event controllers
+    click_gesture = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click_gesture), GDK_BUTTON_PRIMARY);
+    gtk_widget_add_controller(drawing_area, GTK_EVENT_CONTROLLER(click_gesture));
+    g_signal_connect(click_gesture, "pressed", G_CALLBACK(on_pressed), NULL);
+    g_signal_connect(click_gesture, "released", G_CALLBACK(on_released), NULL);
+    
+    motion_controller = gtk_event_controller_motion_new();
+    gtk_widget_add_controller(drawing_area, motion_controller);
+    g_signal_connect(motion_controller, "motion", G_CALLBACK(on_motion), NULL);
+    
+    // Add key controller to window
+    key_controller = gtk_event_controller_key_new();
+    gtk_widget_add_controller(window, key_controller);
+    g_signal_connect(key_controller, "key-pressed", G_CALLBACK(on_key_pressed), NULL);
+    
+    // Show the window
+    gtk_window_present(GTK_WINDOW(window));
+}
+
 
 int main(int argc, char *argv[]) {
+    GtkApplication *app;
+    int status;
+    
     // Check arguments
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <audio_file>\n", argv[0]);
@@ -954,124 +1161,27 @@ int main(int argc, char *argv[]) {
     // Initialize circular buffer for audio data
     init_circular_buffer(&audio_buffer);
     
-    // Initialize GTK
-    gtk_init(&argc, &argv);
-    
-    // Create main window
-    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Sound-Based Drawing App");
-    gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);
-    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
-    
-    // Create a vbox for vertical layout
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_container_add(GTK_CONTAINER(window), vbox);
-    
-    // Create toolbar for controls
-    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 5);
-    
-    // Create tool buttons
-    GtkWidget *pencil_button = gtk_button_new_with_label("Pencil");
-    gtk_widget_set_name(pencil_button, "pencil_button");
-    g_signal_connect(pencil_button, "clicked", G_CALLBACK(on_tool_button), NULL);
-    gtk_box_pack_start(GTK_BOX(toolbar), pencil_button, FALSE, FALSE, 0);
-    
-    GtkWidget *eraser_button = gtk_button_new_with_label("Eraser");
-    gtk_widget_set_name(eraser_button, "eraser_button");
-    g_signal_connect(eraser_button, "clicked", G_CALLBACK(on_tool_button), NULL);
-    gtk_box_pack_start(GTK_BOX(toolbar), eraser_button, FALSE, FALSE, 0);
-    
-    // Create color buttons
-    GtkWidget *color_label = gtk_label_new("Colors:");
-    gtk_box_pack_start(GTK_BOX(toolbar), color_label, FALSE, FALSE, 5);
-    
-    GtkWidget *red_button = gtk_button_new();
-    gtk_widget_set_name(red_button, "red_button");
-    GtkWidget *red_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_container_add(GTK_CONTAINER(red_button), red_box);
-    GtkWidget *red_color = gtk_drawing_area_new();
-    gtk_widget_set_size_request(red_color, 20, 20);
-    g_signal_connect(red_color, "draw", G_CALLBACK(on_draw_color), (gpointer)(uintptr_t)0xFF0000FF);
-    gtk_container_add(GTK_CONTAINER(red_box), red_color);
-    g_signal_connect(red_button, "clicked", G_CALLBACK(on_color_button), NULL);
-    gtk_box_pack_start(GTK_BOX(toolbar), red_button, FALSE, FALSE, 0);
-    
-    GtkWidget *green_button = gtk_button_new();
-    gtk_widget_set_name(green_button, "green_button");
-    GtkWidget *green_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_container_add(GTK_CONTAINER(green_button), green_box);
-    GtkWidget *green_color = gtk_drawing_area_new();
-    gtk_widget_set_size_request(green_color, 20, 20);
-    g_signal_connect(green_color, "draw", G_CALLBACK(on_draw_color), (gpointer)(uintptr_t)0x00CC00FF);
-    gtk_container_add(GTK_CONTAINER(green_box), green_color);
-    g_signal_connect(green_button, "clicked", G_CALLBACK(on_color_button), NULL);
-    gtk_box_pack_start(GTK_BOX(toolbar), green_button, FALSE, FALSE, 0);
-    
-    GtkWidget *blue_button = gtk_button_new();
-    gtk_widget_set_name(blue_button, "blue_button");
-    GtkWidget *blue_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_container_add(GTK_CONTAINER(blue_button), blue_box);
-    GtkWidget *blue_color = gtk_drawing_area_new();
-    gtk_widget_set_size_request(blue_color, 20, 20);
-    g_signal_connect(blue_color, "draw", G_CALLBACK(on_draw_color), (gpointer)(uintptr_t)0x0000FFFF);
-    gtk_container_add(GTK_CONTAINER(blue_box), blue_color);
-    g_signal_connect(blue_button, "clicked", G_CALLBACK(on_color_button), NULL);
-    gtk_box_pack_start(GTK_BOX(toolbar), blue_button, FALSE, FALSE, 0);
-    
-    GtkWidget *black_button = gtk_button_new();
-    gtk_widget_set_name(black_button, "black_button");
-    GtkWidget *black_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_container_add(GTK_CONTAINER(black_button), black_box);
-    GtkWidget *black_color = gtk_drawing_area_new();
-    gtk_widget_set_size_request(black_color, 20, 20);
-    g_signal_connect(black_color, "draw", G_CALLBACK(on_draw_color), (gpointer)(uintptr_t)0x000000FF);
-    gtk_container_add(GTK_CONTAINER(black_box), black_color);
-    g_signal_connect(black_button, "clicked", G_CALLBACK(on_color_button), NULL);
-    gtk_box_pack_start(GTK_BOX(toolbar), black_button, FALSE, FALSE, 0);
-    
-    // Create clear button
-    GtkWidget *clear_button = gtk_button_new_with_label("Clear");
-    g_signal_connect_swapped(clear_button, "clicked", G_CALLBACK(clear_surface), NULL);
-    g_signal_connect_swapped(clear_button, "clicked", G_CALLBACK(gtk_widget_queue_draw), drawing_area);
-    gtk_box_pack_end(GTK_BOX(toolbar), clear_button, FALSE, FALSE, 0);
-    
-    // Create drawing area
-    drawing_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(drawing_area, 800, 600);
-    gtk_box_pack_start(GTK_BOX(vbox), drawing_area, TRUE, TRUE, 0);
-    
-    // Setup signals for drawing area
-    gtk_widget_add_events(drawing_area, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
-    g_signal_connect(drawing_area, "configure-event", G_CALLBACK(on_configure_event), NULL);
-    g_signal_connect(drawing_area, "draw", G_CALLBACK(on_draw), NULL);
-    g_signal_connect(drawing_area, "button-press-event", G_CALLBACK(on_button_press), NULL);
-    g_signal_connect(drawing_area, "button-release-event", G_CALLBACK(on_button_release), NULL);
-    g_signal_connect(drawing_area, "motion-notify-event", G_CALLBACK(on_motion_notify), NULL);
-    
-    // Setup key events for the main window
-    gtk_widget_add_events(window, GDK_KEY_PRESS_MASK);
-    g_signal_connect(window, "key-press-event", G_CALLBACK(on_key_press), NULL);
-    
-    // Setup audio system and start audio thread
-    setup_audio_system();
-    
-    // Create audio thread
+    // Create and start audio thread
     if (pthread_create(&audio_thread, NULL, audio_thread_func, NULL) != 0) {
         fprintf(stderr, "Failed to create audio thread\n");
         return 1;
     }
     
-    // Show all widgets
-    gtk_widget_show_all(window);
+    // Setup audio system
+    setup_audio_system();
     
-    // Start GTK main loop
-    gtk_main();
+    // Initialize GTK
+    app = gtk_application_new("org.example.sounddraw", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(app, "shutdown", G_CALLBACK(on_app_shutdown), NULL);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     
-    // Cleanup
-    keep_running = 0;
-    pthread_join(audio_thread, NULL);
-    cleanup_audio_system();
+    char* gtk_argv[1];
+    gtk_argv[0] = argv[0];
+    int gtk_argc = 1;
+    status = g_application_run(G_APPLICATION(app), gtk_argc, gtk_argv);
     
-    return 0;
+    // Clean up
+    g_object_unref(app);
+    
+    return status;
 }
